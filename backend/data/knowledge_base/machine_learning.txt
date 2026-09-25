@@ -1,0 +1,32 @@
+Machine Learning
+
+Machine learning is a branch of artificial intelligence
+that enables computers to learn patterns from data and
+make predictions or decisions without being explicitly
+programmed for every task.
+
+Supervised learning uses labeled training data. Common
+supervised learning algorithms include linear regression,
+logistic regression, decision trees, support vector
+machines, and neural networks.
+
+Decision trees are supervised learning models used for
+classification and regression. A decision tree consists
+of nodes, branches, and leaves. Internal nodes represent
+decisions based on features, branches represent outcomes,
+and leaf nodes represent predictions.
+
+Entropy is a measure of impurity or uncertainty in a
+dataset. It is commonly used in decision tree algorithms
+to determine useful splits.
+
+Information gain measures how much uncertainty is reduced
+after splitting a dataset based on a particular feature.
+
+Overfitting occurs when a machine learning model performs
+very well on training data but performs poorly on unseen
+data. Decision trees can overfit when they become too
+complex.
+
+Pruning can be used to reduce the complexity of a decision
+tree and help prevent overfitting.
