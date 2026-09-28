@@ -1,17 +1,40 @@
 from pathlib import Path
 
+from preprocessing.document_loader import load_document
+from preprocessing.cleaner import clean_text
+from preprocessing.chunker import chunk_text
 
-def load_text_files(folder_path: str):
+
+def process_document(file_path: str):
+
+    path = Path(file_path)
+
+    raw_text = load_document(
+        str(path)
+    )
+
+    cleaned_text = clean_text(
+        raw_text
+    )
+
+    chunks = chunk_text(
+        cleaned_text
+    )
+
     documents = []
 
-    folder = Path(folder_path)
-
-    for file_path in folder.glob("*.txt"):
-        text = file_path.read_text(encoding="utf-8")
+    for index, chunk in enumerate(
+        chunks
+    ):
 
         documents.append({
-            "text": text,
-            "source": file_path.name
+
+            "text": chunk,
+
+            "source": path.name,
+
+            "chunk_id": index
+
         })
 
     return documents

@@ -1,24 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+backend/venv/
+.venv/
+venv/
+
+# Environment variables / API keys
+.env
+*.env
+
+# QDiff generated model
+backend/qdiff_model/
+
+# RAG generated index
+backend/rag_storage/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
 # Logs
-logs
 *.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
+# IDE
+.vscode/
+.idea/
 
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
+# OS
 .DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
+Thumbs.db
