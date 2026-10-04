@@ -62,3 +62,8 @@ Thumbs.db
 
 *.tmp
 *.temp
+# QDiff trained model and tokenizer
+/backend/qdiff/qdiff_model/
+
+# Large QDiff dataset backup
+/backend/qdiff_dataset/train_before_remember_augmentation.xlsx

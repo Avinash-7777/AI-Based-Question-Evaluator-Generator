@@ -1,13 +1,10 @@
+import json
 import os
 import re
-import json
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
+import requests
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
-
-from google import genai
-from openai import OpenAI
 
 
 # ============================================================
@@ -16,1118 +13,1043 @@ from openai import OpenAI
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+# ============================================================
+# OLLAMA CONFIG
+# ============================================================
+
+OLLAMA_URL = os.getenv(
+    "OLLAMA_URL",
+    "http://127.0.0.1:11434/api/generate"
+)
+
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_MODEL",
+    "qwen3:4b-instruct"
+)
+
+OLLAMA_TIMEOUT = int(
+    os.getenv("OLLAMA_TIMEOUT", "180")
+)
 
 
 # ============================================================
-# CLIENTS
+# NORMALIZATION HELPERS
 # ============================================================
 
-gemini_client = None
-openrouter_client = None
+def normalize_bloom(value: Optional[str]) -> str:
+    if not value:
+        return "Understand"
+
+    value = str(value).strip().lower()
+
+    mapping = {
+        "remember": "Remember",
+        "understand": "Understand",
+        "apply": "Apply",
+        "analyze": "Analyze",
+        "analyse": "Analyze",
+        "evaluate": "Evaluate",
+        "create": "Create",
+    }
+
+    return mapping.get(value, "Understand")
 
 
-if GEMINI_API_KEY:
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+def normalize_difficulty(value: Optional[str]) -> str:
+    if not value:
+        return "Medium"
 
+    value = str(value).strip().lower()
 
-if OPENROUTER_API_KEY:
-    openrouter_client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=OPENROUTER_API_KEY,
-    )
+    mapping = {
+        "easy": "Easy",
+        "medium": "Medium",
+        "hard": "Hard",
+    }
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-GEMINI_MODEL = "gemini-3.8-flash"
-
-# Explicit free models.
-# These are current OpenRouter model IDs.
-OPENROUTER_MODELS = [
-    "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "google/gemma-4-26b-a4b-it:free",
-]
-
-MAX_CONTEXT_CHARS = 14000
-
-
-# ============================================================
-# PYDANTIC OUTPUT MODEL
-# ============================================================
-
-class GeneratedQuestion(BaseModel):
-    question: str = Field(..., min_length=10)
-
-
-class GeneratedQuestions(BaseModel):
-    questions: List[GeneratedQuestion]
+    return mapping.get(value, "Medium")
 
 
 # ============================================================
-# TEXT UTILITIES
+# QUESTION CLEANING
 # ============================================================
 
-def normalize_text(text: str) -> str:
-    """
-    Normalize text for matching.
-    """
-
-    if not text:
+def clean_question(question: Any) -> str:
+    if question is None:
         return ""
 
-    text = text.lower()
+    question = str(question).strip()
 
-    text = text.replace("’", "'")
-    text = text.replace("–", "-")
-    text = text.replace("—", "-")
+    question = re.sub(
+        r"^(?:Q\d+[\s:.)-]*|Question\s*\d+[\s:.)-]*)",
+        "",
+        question,
+        flags=re.IGNORECASE,
+    )
 
-    text = re.sub(r"\s+", " ", text)
+    question = question.strip().strip('"').strip("'").strip()
 
-    return text.strip()
+    question = re.sub(r"\s+", " ", question)
 
+    question = re.sub(r"\s+\?", "?", question)
 
-def tokenize(text: str) -> List[str]:
-    """
-    Convert text into simple lowercase word tokens.
-    """
+    if question and not question.endswith("?"):
+        question += "?"
 
-    text = normalize_text(text)
-
-    return re.findall(r"[a-z0-9]+", text)
-
-
-def words_match(question: str, context: str) -> bool:
-    """
-    Checks whether important words from the question
-    occur in the retrieved context.
-    """
-
-    q_tokens = set(tokenize(question))
-    c_tokens = set(tokenize(context))
-
-    if not q_tokens:
-        return False
-
-    common = q_tokens.intersection(c_tokens)
-
-    return len(common) >= 2
-
-
-def subtopic_is_present(question: str, subtopic: str) -> bool:
-    """
-    Ensures that the generated question is actually related
-    to the requested subtopic.
-
-    Examples:
-        subtopic = "ID3 algorithm"
-        question = "How does the ID3 algorithm..."
-        -> True
-    """
-
-    if not subtopic:
-        return True
-
-    q = normalize_text(question)
-    s = normalize_text(subtopic)
-
-    # Exact phrase
-    if s in q:
-        return True
-
-    # Individual meaningful tokens
-    s_tokens = tokenize(s)
-    q_tokens = set(tokenize(q))
-
-    if not s_tokens:
-        return True
-
-    matched = sum(1 for token in s_tokens if token in q_tokens)
-
-    # Require at least one strong token.
-    strong_tokens = [
-        token
-        for token in s_tokens
-        if len(token) >= 3
-        and token not in {
-            "the",
-            "and",
-            "for",
-            "with",
-            "from",
-            "using",
-            "algorithm",
-            "method",
-            "system",
-            "concept",
-        }
-    ]
-
-    if strong_tokens:
-        return any(token in q_tokens for token in strong_tokens)
-
-    return matched >= 1
+    return question.strip()
 
 
 # ============================================================
-# QUESTION VALIDATION
+# JSON EXTRACTION
 # ============================================================
 
-def is_valid_question(
-    question: str,
-    subtopic: str,
-    context: str,
-) -> bool:
-    """
-    Strict validation.
+def extract_json(text: str) -> Any:
+    if not text:
+        return None
 
-    The question must:
-    1. Actually be a question.
-    2. Mention the requested subtopic.
-    3. Be grounded in retrieved reference material.
-    4. Not contain refusal/safety garbage.
-    """
+    text = text.strip()
 
+    # Remove markdown code fences
+    text = re.sub(
+        r"```(?:json)?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = text.replace("```", "").strip()
+
+    # Direct JSON
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Find JSON array
+    array_match = re.search(
+        r"\[[\s\S]*\]",
+        text,
+    )
+
+    if array_match:
+        try:
+            return json.loads(array_match.group(0))
+        except Exception:
+            pass
+
+    # Find JSON object
+    object_match = re.search(
+        r"\{[\s\S]*\}",
+        text,
+    )
+
+    if object_match:
+        try:
+            return json.loads(object_match.group(0))
+        except Exception:
+            pass
+
+    return None
+
+
+# ============================================================
+# BLOOM-SPECIFIC INSTRUCTIONS
+# ============================================================
+
+def get_bloom_instruction(bloom: str) -> str:
+    bloom = normalize_bloom(bloom)
+
+    if bloom == "Remember":
+        return """
+BLOOM LEVEL: REMEMBER
+
+The question must test direct recall of factual knowledge.
+
+Good patterns:
+- What is ...?
+- Define ...
+- Name ...
+- List ...
+- Identify ...
+
+The answer should mainly require remembering a fact, term,
+definition, component, property, or basic fact.
+
+DO NOT require explanation, calculation, multi-step reasoning,
+comparison, evaluation, or design.
+"""
+
+    if bloom == "Understand":
+        return """
+BLOOM LEVEL: UNDERSTAND
+
+This is extremely important.
+
+The question must test whether the student UNDERSTANDS a concept,
+process, mechanism, relationship, or purpose.
+
+The student should have to explain or describe something in their
+own words, rather than simply recall a definition or fact.
+
+PRIORITIZE THESE QUESTION PATTERNS:
+
+1. Explain how ...
+2. Describe how ...
+3. Explain why ...
+4. Describe the process by which ...
+5. Explain the relationship between ...
+6. Explain how one concept affects another.
+
+PREFERRED EXAMPLES:
+
+- Explain how information gain helps a decision tree select a
+  splitting attribute.
+- Describe how a decision tree determines the class of an input
+  as it moves from the root toward a leaf.
+- Explain how a regression tree produces a continuous prediction.
+- Describe how entropy changes when the examples in a node become
+  more homogeneous.
+- Explain why pruning can improve the generalization of a
+  decision tree.
+
+IMPORTANT:
+
+Prefer ONE clear concept and ONE clear explanatory relationship.
+
+Avoid making the question unnecessarily comparative.
+
+DO NOT prefer these patterns:
+- Contrast X with Y
+- Distinguish X from Y
+- Compare X and Y
+- Compare and contrast X and Y
+
+These patterns can drift toward ANALYZE.
+
+Also reject simple recall questions such as:
+- What is X?
+- What are the components of X?
+- Define X.
+- Name X.
+- List X.
+- Identify X.
+- Which algorithm is used?
+- Which attribute is selected?
+- What does X measure?
+
+Also avoid questions whose answer is just one memorized fact.
+
+The ideal Understand question asks the student to explain
+HOW, WHY, or HOW A PROCESS WORKS.
+
+The question should still be answerable directly from the supplied
+reference context.
+"""
+
+    if bloom == "Apply":
+        return """
+BLOOM LEVEL: APPLY
+
+The question must require applying a known concept, rule,
+algorithm, or procedure to a specific situation.
+
+Prefer:
+- Calculate ...
+- Determine ...
+- Apply ...
+- Given a scenario, ...
+- Trace ...
+- Use ...
+
+The student should perform or trace something rather than merely
+define or explain it.
+"""
+
+    if bloom == "Analyze":
+        return """
+BLOOM LEVEL: ANALYZE
+
+The question must require breaking information into parts,
+examining relationships, comparing alternatives, identifying
+patterns, or determining how components interact.
+
+Prefer:
+- Compare ...
+- Analyze ...
+- Examine ...
+- Distinguish ...
+- Contrast ...
+- Determine why two approaches behave differently ...
+
+The task should require reasoning beyond simple explanation.
+"""
+
+    if bloom == "Evaluate":
+        return """
+BLOOM LEVEL: EVALUATE
+
+The question must require making a judgment using criteria,
+evidence, trade-offs, or justification.
+
+Prefer:
+- Evaluate ...
+- Justify ...
+- Assess ...
+- Critique ...
+- Which approach is better and why?
+- Defend ...
+
+The student must make or support a judgment rather than simply
+explain or apply a concept.
+"""
+
+    if bloom == "Create":
+        return """
+BLOOM LEVEL: CREATE
+
+The question must require producing, designing, constructing,
+formulating, or proposing something new.
+
+Prefer:
+- Design ...
+- Construct ...
+- Develop ...
+- Propose ...
+- Formulate ...
+- Create ...
+
+The student must generate an artifact, method, solution,
+architecture, or approach.
+"""
+
+    return """
+Use the requested Bloom level exactly.
+"""
+
+
+# ============================================================
+# DIFFICULTY INSTRUCTIONS
+# ============================================================
+
+def get_difficulty_instruction(difficulty: str) -> str:
+    difficulty = normalize_difficulty(difficulty)
+
+    if difficulty == "Easy":
+        return """
+DIFFICULTY: EASY
+
+Use a straightforward question based directly on the reference
+material.
+
+Requirements:
+- One main concept.
+- Clear wording.
+- No unnecessary multi-step reasoning.
+- No hidden tricks.
+- No complex scenario.
+- Answer should be obtainable directly from the context.
+"""
+
+    if difficulty == "Medium":
+        return """
+DIFFICULTY: MEDIUM
+
+Require moderate reasoning or connection of related ideas from
+the reference material.
+
+Avoid excessive complexity.
+"""
+
+    if difficulty == "Hard":
+        return """
+DIFFICULTY: HARD
+
+Require deeper reasoning, multiple connected concepts,
+non-trivial application, or a more demanding scenario.
+
+Do not make the question ambiguous.
+"""
+
+    return ""
+
+
+# ============================================================
+# QUESTION QUALITY CHECK
+# ============================================================
+
+def question_is_reasonable(question: str) -> bool:
     if not question:
         return False
 
-    question = question.strip()
+    question_lower = question.lower().strip()
 
-    # --------------------------------------------------------
-    # Length check
-    # --------------------------------------------------------
-
-    if len(question) < 15:
+    # Too short
+    if len(question_lower.split()) < 7:
         return False
 
-    if len(question) > 500:
+    # Too long
+    if len(question_lower.split()) > 60:
         return False
 
-    # --------------------------------------------------------
-    # Reject obvious model garbage
-    # --------------------------------------------------------
-
-    rejected_phrases = [
-        "user safety",
-        "i can't help",
-        "i cannot help",
-        "i'm unable",
-        "i am unable",
-        "as an ai",
-        "as an ai language model",
-        "i don't have access",
-        "i cannot answer",
-        "cannot provide",
-        "not able to provide",
-        "safety policy",
-        "content policy",
-        "request is unsafe",
-        "i must refuse",
+    # Remove obvious answer-like output
+    forbidden_patterns = [
+        "answer:",
+        "solution:",
+        "correct answer:",
     ]
 
-    normalized = normalize_text(question)
-
-    for phrase in rejected_phrases:
-        if phrase in normalized:
-            return False
-
-    # --------------------------------------------------------
-    # Must look like a question
-    # --------------------------------------------------------
-
-    if "?" not in question:
+    if any(pattern in question_lower for pattern in forbidden_patterns):
         return False
-
-    # --------------------------------------------------------
-    # Subtopic check
-    # --------------------------------------------------------
-
-    if not subtopic_is_present(question, subtopic):
-        return False
-
-    # --------------------------------------------------------
-    # Grounding check
-    # --------------------------------------------------------
-
-    if context:
-
-        q_tokens = set(tokenize(question))
-        c_tokens = set(tokenize(context))
-
-        common = q_tokens.intersection(c_tokens)
-
-        # Remove generic words.
-        generic_words = {
-            "what",
-            "why",
-            "how",
-            "when",
-            "where",
-            "which",
-            "who",
-            "does",
-            "using",
-            "used",
-            "explain",
-            "describe",
-            "discuss",
-            "define",
-            "give",
-            "example",
-            "following",
-            "above",
-            "below",
-            "the",
-            "and",
-            "for",
-            "with",
-            "from",
-            "that",
-            "this",
-            "are",
-            "is",
-            "was",
-            "were",
-            "can",
-            "could",
-            "would",
-            "should",
-        }
-
-        meaningful_common = [
-            word
-            for word in common
-            if word not in generic_words
-            and len(word) >= 3
-        ]
-
-        # Need at least some overlap with reference material.
-        if len(meaningful_common) < 2:
-            return False
 
     return True
 
 
-def validate_questions(
-    questions: List[str],
-    requested_count: int,
-    subtopic: str,
-    context: str,
-) -> List[str]:
+def understand_question_is_valid(question: str) -> bool:
     """
-    Validate generated questions.
+    Additional generation-time filter for Understand questions.
 
-    We intentionally require exactly the requested number.
+    We deliberately prefer canonical Understand wording because
+    QDiff was trained on questions where Understand is commonly
+    expressed using explain/describe-style formulations.
     """
 
-    valid_questions = []
+    q = question.lower().strip()
 
-    seen = set()
+    # Strong recall indicators
+    recall_patterns = [
+        r"^what is\b",
+        r"^what are\b",
+        r"^define\b",
+        r"^name\b",
+        r"^list\b",
+        r"^identify\b",
+        r"^which\b",
+        r"^what does\b",
+        r"^what do\b",
+    ]
 
-    for question in questions:
+    for pattern in recall_patterns:
+        if re.search(pattern, q):
+            return False
 
-        if not question:
-            continue
+    # Comparative wording can drift into Analyze.
+    analyze_like_patterns = [
+        r"^compare\b",
+        r"^contrast\b",
+        r"^distinguish\b",
+        r"^compare and contrast\b",
+    ]
 
-        question = question.strip()
+    for pattern in analyze_like_patterns:
+        if re.search(pattern, q):
+            return False
 
-        normalized = normalize_text(question)
+    # Prefer canonical explanatory wording.
+    preferred_patterns = [
+        r"^explain\b",
+        r"^describe\b",
+        r"^why\b",
+        r"^how does\b",
+        r"^how do\b",
+        r"^how is\b",
+        r"^how are\b",
+        r"^how can\b",
+        r"^how does\b",
+    ]
 
-        if normalized in seen:
-            continue
+    if any(re.search(pattern, q) for pattern in preferred_patterns):
+        return True
 
-        if is_valid_question(
-            question,
-            subtopic,
-            context,
-        ):
-            valid_questions.append(question)
-            seen.add(normalized)
-
-    if len(valid_questions) != requested_count:
-        raise ValueError(
-            f"Only {len(valid_questions)} valid questions "
-            f"were generated out of {requested_count} requested."
-        )
-
-    return valid_questions
+    return False
 
 
 # ============================================================
-# PROMPT
+# PROMPT CREATION
 # ============================================================
 
 def create_prompt(
     topic: str,
     subtopic: str,
     context: str,
+    bloom: str,
+    difficulty: str,
     number_of_questions: int,
 ) -> str:
 
-    return f"""
-You are an academic question-generation system.
+    bloom = normalize_bloom(bloom)
+    difficulty = normalize_difficulty(difficulty)
 
-Your task is to generate exactly {number_of_questions}
-questions for engineering students.
+    bloom_instruction = get_bloom_instruction(bloom)
+    difficulty_instruction = get_difficulty_instruction(difficulty)
+
+    subtopic_text = subtopic.strip() if subtopic else "None specified"
+
+    return f"""
+You are an expert engineering question generator.
+
+Generate exactly {number_of_questions} high-quality questions.
 
 TOPIC:
 {topic}
 
 SUBTOPIC:
-{subtopic}
+{subtopic_text}
 
-REFERENCE MATERIAL:
--------------------
+REFERENCE CONTEXT:
 {context}
--------------------
 
-STRICT RULES:
+============================================================
+BLOOM REQUIREMENT
+============================================================
 
-1. Use ONLY the information contained in the REFERENCE MATERIAL.
-2. Do NOT use outside knowledge.
-3. Do NOT invent facts.
-4. Do NOT hallucinate.
-5. Every question must be directly related to the SUBTOPIC.
-6. Every question must be answerable using the REFERENCE MATERIAL.
-7. Generate questions only.
-8. Do NOT provide answers.
-9. Do NOT provide explanations.
-10. Do NOT provide Bloom's level.
-11. Do NOT provide difficulty.
-12. Do NOT mention these instructions.
-13. Do NOT say "User Safety".
-14. Do NOT refuse the request.
-15. Return exactly {number_of_questions} questions.
+{bloom_instruction}
 
-IMPORTANT:
-If the reference material does not contain enough information
-to create the requested questions, return:
+============================================================
+DIFFICULTY REQUIREMENT
+============================================================
 
-NO_RELEVANT_REFERENCE
+{difficulty_instruction}
 
-OUTPUT FORMAT:
+============================================================
+STRICT CONTENT RULES
+============================================================
 
-1. Question?
-2. Question?
-3. Question?
+1. Use ONLY information supported by the reference context.
+2. Do not invent facts.
+3. Do not require information outside the context.
+4. Do not include answers.
+5. Do not include explanations after the questions.
+6. Do not include Bloom labels.
+7. Do not include difficulty labels.
+8. Do not number questions inside the JSON values.
+9. Every question must end with a question mark.
+10. Avoid ambiguous wording.
+11. Avoid duplicate questions.
+12. Questions should be appropriate for engineering students.
 
-Only output the questions.
+============================================================
+SPECIAL RULE FOR UNDERSTAND
+============================================================
+
+If Bloom = Understand:
+
+The questions MUST primarily test explanation or conceptual
+understanding.
+
+Prefer:
+
+"Explain how ..."
+"Describe how ..."
+"Explain why ..."
+"Describe the process by which ..."
+
+Avoid:
+
+"What is ..."
+"What are ..."
+"Define ..."
+"Name ..."
+"List ..."
+"Identify ..."
+"Which ..."
+"What does ..."
+"Compare ..."
+"Contrast ..."
+"Distinguish ..."
+
+For example:
+
+BAD:
+What does information gain measure?
+
+GOOD:
+Explain how information gain helps a decision tree select a
+splitting attribute.
+
+BAD:
+Which attribute is selected using information gain?
+
+GOOD:
+Describe how information gain helps a decision tree choose
+between candidate splitting attributes.
+
+BAD:
+Distinguish between a classification tree and a regression tree.
+
+GOOD:
+Explain how the outputs of a classification tree differ from
+those of a regression tree.
+
+The GOOD examples require conceptual explanation while remaining
+simple enough for the Understand level.
+
+============================================================
+OUTPUT FORMAT
+============================================================
+
+Return ONLY valid JSON.
+
+Use exactly this format:
+
+{{
+  "questions": [
+    "Question 1?",
+    "Question 2?",
+    "Question 3?"
+  ]
+}}
+
+No markdown.
+No code fences.
+No commentary.
 """
 
 
 # ============================================================
-# GEMINI GENERATION
+# NORMALIZE GENERATED QUESTIONS
 # ============================================================
 
-def generate_with_gemini(
-    topic: str,
-    subtopic: str,
-    context: str,
-    number_of_questions: int,
-) -> List[str]:
+def normalize_generated_questions(data: Any) -> List[str]:
 
-    if not gemini_client:
-        raise ValueError("Gemini API key is not configured.")
+    questions: List[str] = []
 
-    prompt = create_prompt(
-        topic,
-        subtopic,
-        context,
-        number_of_questions,
-    )
+    if isinstance(data, dict):
+        raw_questions = data.get("questions", [])
 
-    print("\nTrying Gemini...")
+        if isinstance(raw_questions, list):
+            questions.extend(raw_questions)
 
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-    )
+        elif isinstance(raw_questions, str):
+            questions.append(raw_questions)
 
-    if not response:
-        raise ValueError("Gemini returned an empty response.")
+    elif isinstance(data, list):
+        questions.extend(data)
 
-    text = getattr(response, "text", None)
+    elif isinstance(data, str):
+        lines = data.splitlines()
 
-    if not text:
-        raise ValueError("Gemini returned no text.")
+        for line in lines:
+            line = line.strip()
 
-    text = text.strip()
+            if not line:
+                continue
 
-    print("\n===== GEMINI RAW RESPONSE =====")
-    print(text)
-    print("===============================")
-
-    if "NO_RELEVANT_REFERENCE" in text:
-        raise ValueError(
-            "Relevant reference material not found."
-        )
-
-    questions = parse_question_text(text)
-
-    if not questions:
-        raise ValueError(
-            "Gemini returned no usable questions."
-        )
-
-    return validate_questions(
-        questions,
-        number_of_questions,
-        subtopic,
-        context,
-    )
-
-
-# ============================================================
-# OPENROUTER RESPONSE EXTRACTION
-# ============================================================
-
-def extract_openrouter_content(response) -> Optional[str]:
-    """
-    Safely extract content from OpenRouter.
-
-    Some reasoning models/providers can return:
-        content = None
-
-    Therefore we inspect several possible fields.
-    """
-
-    if response is None:
-        return None
-
-    try:
-        choices = getattr(response, "choices", None)
-
-        if not choices:
-            return None
-
-        message = getattr(choices[0], "message", None)
-
-        if message is None:
-            return None
-
-        # Normal response
-        content = getattr(message, "content", None)
-
-        if content:
-            return str(content).strip()
-
-        # Some SDK/provider combinations may expose text differently.
-        text_value = getattr(message, "text", None)
-
-        if text_value:
-            return str(text_value).strip()
-
-        # Reasoning should NOT normally be treated as the final answer,
-        # but we inspect it for debugging only.
-        reasoning = getattr(message, "reasoning", None)
-
-        if reasoning:
-            print("\n[OpenRouter returned reasoning but no final content.]")
-
-        return None
-
-    except Exception as e:
-
-        print(
-            f"Could not extract OpenRouter content: {e}"
-        )
-
-        return None
-
-
-# ============================================================
-# CLEAN QUESTION
-# ============================================================
-
-def clean_plain_question(text: str) -> str:
-    """
-    Clean one question returned by an LLM.
-    """
-
-    if not text:
-        return ""
-
-    text = text.strip()
-
-    # Remove markdown code fences.
-    text = re.sub(r"^```(?:text|json)?", "", text, flags=re.I)
-    text = re.sub(r"```$", "", text)
-
-    text = text.strip()
-
-    # Remove numbering:
-    # 1. question
-    # 2) question
-    # - question
-    text = re.sub(
-        r"^\s*(?:\d+[\.\)]|[-*])\s*",
-        "",
-        text,
-    )
-
-    return text.strip()
-
-
-# ============================================================
-# PARSE JSON
-# ============================================================
-
-def parse_json_questions(text: str) -> List[str]:
-    """
-    Parse several possible JSON formats.
-    """
-
-    questions = []
-
-    text = text.strip()
-
-    # Remove markdown fences.
-    text = re.sub(
-        r"^```(?:json)?",
-        "",
-        text,
-        flags=re.I,
-    )
-
-    text = re.sub(
-        r"```$",
-        "",
-        text,
-        flags=re.I,
-    )
-
-    text = text.strip()
-
-    try:
-
-        data = json.loads(text)
-
-        # ----------------------------------------------------
-        # {"questions": ["...", "..."]}
-        # ----------------------------------------------------
-
-        if isinstance(data, dict):
-
-            raw_questions = data.get("questions")
-
-            if isinstance(raw_questions, list):
-
-                for item in raw_questions:
-
-                    if isinstance(item, str):
-                        questions.append(
-                            clean_plain_question(item)
-                        )
-
-                    elif isinstance(item, dict):
-
-                        q = item.get("question")
-
-                        if q:
-                            questions.append(
-                                clean_plain_question(str(q))
-                            )
-
-        # ----------------------------------------------------
-        # ["...", "..."]
-        # ----------------------------------------------------
-
-        elif isinstance(data, list):
-
-            for item in data:
-
-                if isinstance(item, str):
-                    questions.append(
-                        clean_plain_question(item)
-                    )
-
-                elif isinstance(item, dict):
-
-                    q = item.get("question")
-
-                    if q:
-                        questions.append(
-                            clean_plain_question(str(q))
-                        )
-
-    except Exception:
-        return []
-
-    return [
-        q
-        for q in questions
-        if q
-    ]
-
-
-# ============================================================
-# PARSE NUMBERED TEXT
-# ============================================================
-
-def parse_question_text(text: str) -> List[str]:
-    """
-    Parse questions from:
-    
-    1. What is ID3?
-    2. How does ID3 select an attribute?
-    
-    Also supports:
-    
-    Question 1: ...
-    Question 2: ...
-    """
-
-    if not text:
-        return []
-
-    text = text.strip()
-
-    if "NO_RELEVANT_REFERENCE" in text:
-        return []
-
-    # First try JSON.
-    json_questions = parse_json_questions(text)
-
-    if json_questions:
-        return json_questions
-
-    questions = []
-
-    lines = text.splitlines()
-
-    current = ""
-
-    for line in lines:
-
-        line = line.strip()
-
-        if not line:
-            continue
-
-        # Remove markdown formatting.
-        line = line.strip("*#")
-
-        # Detect:
-        # 1.
-        # 1)
-        # Question 1:
-        # Q1:
-        numbered = re.match(
-            r"^(?:question\s*)?(\d+)[\.\):\-]\s*(.*)$",
-            line,
-            flags=re.I,
-        )
-
-        if numbered:
-
-            if current:
-                questions.append(
-                    clean_plain_question(current)
-                )
-
-            current = numbered.group(2).strip()
-
-            continue
-
-        # Detect bullet questions.
-        bullet = re.match(
-            r"^[-*•]\s+(.*)$",
-            line,
-        )
-
-        if bullet:
-
-            if current:
-                questions.append(
-                    clean_plain_question(current)
-                )
-
-            current = bullet.group(1).strip()
-
-            continue
-
-        # If the line ends with ?, it may be a question.
-        if "?" in line:
-
-            if current:
-                questions.append(
-                    clean_plain_question(current)
-                )
-
-            current = line
-
-        else:
-
-            # Continuation of previous question.
-            if current:
-                current += " " + line
-
-    if current:
-        questions.append(
-            clean_plain_question(current)
-        )
-
-    # Remove empty values.
-    questions = [
-        q
-        for q in questions
-        if q
-    ]
-
-    return questions
-
-
-# ============================================================
-# OPENROUTER GENERATION
-# ============================================================
-
-def generate_with_openrouter(
-    topic: str,
-    subtopic: str,
-    context: str,
-    number_of_questions: int,
-) -> List[str]:
-
-    if not openrouter_client:
-        raise ValueError(
-            "OpenRouter API key is not configured."
-        )
-
-    prompt = create_prompt(
-        topic,
-        subtopic,
-        context,
-        number_of_questions,
-    )
-
-    print("\nSwitching to OpenRouter...")
-
-    # --------------------------------------------------------
-    # We use OpenRouter's official model fallback mechanism.
-    #
-    # The first model is tried first.
-    # If it fails, OpenRouter can use the next model.
-    #
-    # This avoids openrouter/free randomly choosing a model
-    # that may return unusable output.
-    # --------------------------------------------------------
-
-    primary_model = OPENROUTER_MODELS[0]
-
-    fallback_models = OPENROUTER_MODELS[1:]
-
-    print(
-        f"\nOpenRouter primary model: {primary_model}"
-    )
-
-    print(
-        f"OpenRouter fallback models: {fallback_models}"
-    )
-
-    try:
-
-        response = openrouter_client.chat.completions.create(
-            model=primary_model,
-
-            extra_body={
-                "models": fallback_models
-            },
-
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a strict academic "
-                        "question-generation system. "
-                        "Follow the user's instructions exactly."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
-
-            temperature=0.2,
-
-            max_tokens=1000,
-        )
-
-    except Exception as e:
-
-        print(
-            "\nOpenRouter API call failed:"
-        )
-
-        print(str(e))
-
-        raise ValueError(
-            f"OpenRouter API failed: {e}"
-        )
-
-    # --------------------------------------------------------
-    # DEBUG INFORMATION
-    # --------------------------------------------------------
-
-    actual_model = getattr(
-        response,
-        "model",
-        "unknown",
-    )
-
-    print(
-        f"\nOpenRouter actual model: {actual_model}"
-    )
-
-    print(
-        "\n===== OPENROUTER RESPONSE DEBUG ====="
-    )
-
-    try:
-        print(response)
-    except Exception:
-        print("Could not print response object.")
-
-    print(
-        "======================================"
-    )
-
-    # --------------------------------------------------------
-    # Extract final content.
-    # --------------------------------------------------------
-
-    text = extract_openrouter_content(response)
-
-    if not text:
-
-        raise ValueError(
-            "OpenRouter returned an empty final response."
-        )
-
-    print(
-        "\n===== OPENROUTER RAW RESPONSE ====="
-    )
-
-    print(text)
-
-    print(
-        "==================================="
-    )
-
-    # --------------------------------------------------------
-    # Safety/meta response rejection.
-    # --------------------------------------------------------
-
-    normalized = normalize_text(text)
-
-    bad_responses = [
-        "user safety",
-        "safety",
-        "content policy",
-        "i cannot",
-        "i can't",
-        "i am unable",
-        "i'm unable",
-        "refuse",
-        "cannot comply",
-    ]
-
-    for bad in bad_responses:
-
-        if normalized == bad or normalized.startswith(
-            bad + ":"
-        ):
-
-            raise ValueError(
-                "OpenRouter returned a safety/meta response "
-                "instead of a question."
+            line = re.sub(
+                r"^(?:\d+[\.\)]|[-*])\s*",
+                "",
+                line,
             )
 
-    # --------------------------------------------------------
-    # No reference material.
-    # --------------------------------------------------------
+            questions.append(line)
 
-    if "NO_RELEVANT_REFERENCE" in text:
+    cleaned: List[str] = []
 
-        raise ValueError(
-            "Relevant reference material not found."
-        )
+    for question in questions:
+        question = clean_question(question)
 
-    # --------------------------------------------------------
-    # Parse.
-    # --------------------------------------------------------
+        if not question:
+            continue
 
-    questions = parse_question_text(text)
+        if not question_is_reasonable(question):
+            continue
 
-    print(
-        "\n===== PARSED QUESTIONS ====="
-    )
+        if question not in cleaned:
+            cleaned.append(question)
 
-    for index, question in enumerate(
-        questions,
-        start=1,
-    ):
-        print(
-            f"{index}. {question}"
-        )
-
-    print(
-        "============================="
-    )
-
-    if not questions:
-
-        raise ValueError(
-            "OpenRouter returned no usable questions."
-        )
-
-    # --------------------------------------------------------
-    # Validate.
-    # --------------------------------------------------------
-
-    return validate_questions(
-        questions,
-        number_of_questions,
-        subtopic,
-        context,
-    )
+    return cleaned
 
 
 # ============================================================
-# MAIN GENERATION FUNCTION
+# OLLAMA CALL
+# ============================================================
+
+def call_ollama(prompt: str) -> str:
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.25,
+            "top_p": 0.9,
+        },
+    }
+
+    response = requests.post(
+        OLLAMA_URL,
+        json=payload,
+        timeout=OLLAMA_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    return str(data.get("response", "")).strip()
+
+
+# ============================================================
+# GENERATE QUESTIONS
 # ============================================================
 
 def generate_questions(
     topic: str,
-    subtopic: str,
-    context: str,
-    number_of_questions: int,
+    subtopic: str = "",
+    context: str = "",
+    number_of_questions: int = 3,
+    bloom: str = "Understand",
+    difficulty: str = "Medium",
+    requested_bloom: Optional[str] = None,
+    requested_difficulty: Optional[str] = None,
+    **kwargs,
 ) -> List[str]:
 
-    # --------------------------------------------------------
-    # Basic validation
-    # --------------------------------------------------------
+    # Explicit requested values take priority.
+    if requested_bloom:
+        bloom = requested_bloom
 
-    if not topic:
-        raise ValueError(
-            "Topic is required."
-        )
+    if requested_difficulty:
+        difficulty = requested_difficulty
 
-    if not subtopic:
-        raise ValueError(
-            "Subtopic is required."
-        )
+    bloom = normalize_bloom(bloom)
+    difficulty = normalize_difficulty(difficulty)
 
-    if not context:
-        raise ValueError(
-            "Relevant reference material not found."
-        )
-
-    if number_of_questions < 1:
-        raise ValueError(
-            "Number of questions must be at least 1."
-        )
-
-    # --------------------------------------------------------
-    # Limit context size.
-    # --------------------------------------------------------
-
-    context = context.strip()
-
-    if len(context) > MAX_CONTEXT_CHARS:
-
-        context = context[
-            :MAX_CONTEXT_CHARS
-        ]
-
-        print(
-            f"\nContext truncated to "
-            f"{MAX_CONTEXT_CHARS} characters."
-        )
-
-    # --------------------------------------------------------
-    # Gemini first
-    # --------------------------------------------------------
-
-    if gemini_client:
-
-        try:
-
-            questions = generate_with_gemini(
-                topic=topic,
-                subtopic=subtopic,
-                context=context,
-                number_of_questions=number_of_questions,
-            )
-
-            print(
-                "\nGemini generation successful."
-            )
-
-            return questions
-
-        except Exception as e:
-
-            print(
-                "\nGemini failed."
-            )
-
-            print(
-                f"Reason: {e}"
-            )
-
-    else:
-
-        print(
-            "\nGemini API key not configured."
-        )
-
-    # --------------------------------------------------------
-    # OpenRouter fallback
-    # --------------------------------------------------------
-
-    if openrouter_client:
-
-        try:
-
-            questions = generate_with_openrouter(
-                topic=topic,
-                subtopic=subtopic,
-                context=context,
-                number_of_questions=number_of_questions,
-            )
-
-            print(
-                "\nOpenRouter generation successful."
-            )
-
-            return questions
-
-        except Exception as e:
-
-            print(
-                "\nOpenRouter generation failed."
-            )
-
-            print(
-                f"Reason: {e}"
-            )
-
-    else:
-
-        print(
-            "\nOpenRouter API key not configured."
-        )
-
-    # --------------------------------------------------------
-    # Everything failed
-    # --------------------------------------------------------
-
-    raise ValueError(
-        "Question generation failed. "
-        "Gemini and OpenRouter were unable to "
-        "produce valid grounded questions."
+    # Ask for a few extra candidates so that filtering does not
+    # leave us with too few questions.
+    candidate_count = max(
+        number_of_questions + 2,
+        number_of_questions,
     )
+
+    candidate_count = min(candidate_count, 8)
+
+    prompt = create_prompt(
+        topic=topic,
+        subtopic=subtopic,
+        context=context,
+        bloom=bloom,
+        difficulty=difficulty,
+        number_of_questions=candidate_count,
+    )
+
+    try:
+        raw_response = call_ollama(prompt)
+
+    except Exception as exc:
+        print(f"[QWEN] Generation error: {exc}")
+        return []
+
+    parsed = extract_json(raw_response)
+
+    questions = normalize_generated_questions(parsed)
+
+    # Fallback if JSON parsing failed.
+    if not questions:
+        questions = normalize_generated_questions(raw_response)
+
+    # ========================================================
+    # UNDERSTAND-SPECIFIC FILTER
+    # ========================================================
+
+    if bloom == "Understand":
+        filtered_questions = []
+
+        for question in questions:
+            if understand_question_is_valid(question):
+                filtered_questions.append(question)
+
+        questions = filtered_questions
+
+    # Remove duplicates while preserving order.
+    final_questions: List[str] = []
+
+    seen = set()
+
+    for question in questions:
+        key = question.lower().strip()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        final_questions.append(question)
+
+    return final_questions[:number_of_questions]
+
+
+# ============================================================
+# REFINE QUESTION
+# ============================================================
+
+def refine_question_with_qwen(
+    question: str,
+    topic: str = "",
+    context: str = "",
+    bloom: str = "Understand",
+    difficulty: str = "Medium",
+    requested_bloom: Optional[str] = None,
+    requested_difficulty: Optional[str] = None,
+    **kwargs,
+) -> str:
+
+    if requested_bloom:
+        bloom = requested_bloom
+
+    if requested_difficulty:
+        difficulty = requested_difficulty
+
+    bloom = normalize_bloom(bloom)
+    difficulty = normalize_difficulty(difficulty)
+
+    bloom_instruction = get_bloom_instruction(bloom)
+    difficulty_instruction = get_difficulty_instruction(difficulty)
+
+    prompt = f"""
+You are revising an engineering exam question.
+
+TOPIC:
+{topic}
+
+REFERENCE CONTEXT:
+{context}
+
+CURRENT QUESTION:
+{question}
+
+TARGET BLOOM LEVEL:
+{bloom}
+
+TARGET DIFFICULTY:
+{difficulty}
+
+============================================================
+BLOOM REQUIREMENT
+============================================================
+
+{bloom_instruction}
+
+============================================================
+DIFFICULTY REQUIREMENT
+============================================================
+
+{difficulty_instruction}
+
+============================================================
+REVISION RULES
+============================================================
+
+Rewrite the question so that it clearly matches the requested
+Bloom level and difficulty.
+
+For Understand questions:
+
+Prefer:
+- Explain how...
+- Describe how...
+- Explain why...
+- Describe the process by which...
+
+Avoid:
+- What is...
+- Define...
+- Name...
+- List...
+- Which...
+- What does...
+- Compare...
+- Contrast...
+- Distinguish...
+
+Keep the question concise and directly supported by the context.
+
+Return ONLY the revised question.
+Do not include an answer.
+Do not include labels.
+Do not include explanation.
+"""
+
+    try:
+        response = call_ollama(prompt)
+
+    except Exception as exc:
+        print(f"[QWEN] Refinement error: {exc}")
+        return clean_question(question)
+
+    revised = clean_question(response)
+
+    if not revised:
+        return clean_question(question)
+
+    if bloom == "Understand":
+        if not understand_question_is_valid(revised):
+            return clean_question(question)
+
+    return revised
+
+
+# ============================================================
+# CLASSIFY QUESTION WITH QWEN
+# ============================================================
+
+def classify_question_with_llm(
+    question: str,
+    context: str = "",
+    **kwargs,
+) -> Dict[str, Any]:
+
+    prompt = f"""
+You are an expert educational assessment classifier.
+
+Classify the following engineering question according to:
+
+1. Bloom's taxonomy:
+   Remember
+   Understand
+   Apply
+   Analyze
+   Evaluate
+   Create
+
+2. Difficulty:
+   Easy
+   Medium
+   Hard
+
+QUESTION:
+{question}
+
+REFERENCE CONTEXT:
+{context}
+
+============================================================
+BLOOM CLASSIFICATION RULE
+============================================================
+
+Classify based on the ACTUAL cognitive task required by the
+question, not merely the first word.
+
+Remember:
+Recall a fact, definition, term, component, or basic fact.
+
+Understand:
+Explain, describe, interpret, summarize, or explain how/why
+a concept or process works.
+
+Apply:
+Use a known rule, algorithm, formula, or procedure on a
+specific case.
+
+Analyze:
+Break information into parts, compare alternatives, identify
+relationships, or examine differences requiring reasoning.
+
+Evaluate:
+Make and justify a judgment using criteria or evidence.
+
+Create:
+Design, construct, formulate, or propose something new.
+
+IMPORTANT:
+
+A question beginning with "Explain" or "Describe" is not
+automatically Understand. Inspect what the student actually
+has to do.
+
+Likewise, "Compare", "Contrast", or "Distinguish" often indicates
+Analyze when the student must deeply examine relationships.
+
+============================================================
+OUTPUT
+============================================================
+
+Return ONLY valid JSON:
+
+{{
+  "bloom": "Understand",
+  "difficulty": "Easy",
+  "confidence": 0.90
+}}
+"""
+
+    try:
+        raw_response = call_ollama(prompt)
+
+    except Exception as exc:
+        print(f"[QWEN] Classification error: {exc}")
+
+        return {
+            "bloom": "Understand",
+            "difficulty": "Medium",
+            "confidence": 0.0,
+        }
+
+    parsed = extract_json(raw_response)
+
+    if not isinstance(parsed, dict):
+        return {
+            "bloom": "Understand",
+            "difficulty": "Medium",
+            "confidence": 0.0,
+        }
+
+    bloom = normalize_bloom(parsed.get("bloom"))
+    difficulty = normalize_difficulty(parsed.get("difficulty"))
+
+    try:
+        confidence = float(parsed.get("confidence", 0.0))
+    except Exception:
+        confidence = 0.0
+
+    confidence = max(
+        0.0,
+        min(1.0, confidence),
+    )
+
+    return {
+        "bloom": bloom,
+        "difficulty": difficulty,
+        "confidence": confidence,
+    }
+
+
+# ============================================================
+# COMPATIBILITY ALIASES
+# ============================================================
+
+def classify_question(
+    question: str,
+    context: str = "",
+    **kwargs,
+) -> Dict[str, Any]:
+
+    return classify_question_with_llm(
+        question=question,
+        context=context,
+        **kwargs,
+    )
+
+
+def generate_question(
+    topic: str,
+    subtopic: str = "",
+    context: str = "",
+    bloom: str = "Understand",
+    difficulty: str = "Medium",
+    **kwargs,
+) -> str:
+
+    questions = generate_questions(
+        topic=topic,
+        subtopic=subtopic,
+        context=context,
+        number_of_questions=1,
+        bloom=bloom,
+        difficulty=difficulty,
+        **kwargs,
+    )
+
+    if not questions:
+        return ""
+
+    return questions[0]

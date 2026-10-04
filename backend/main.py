@@ -1,24 +1,36 @@
 from pathlib import Path
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from qdiff.predictor import predict_question
+from llm.generator import (
+    classify_question_with_llm,
+    generate_questions,
+    refine_question_with_qwen,
+)
+from rag.retriever import Retriever
+
 
 # ============================================================
-# APP
+# PATHS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+RAG_STORAGE_DIR = BASE_DIR / "rag_storage"
+
+
+# ============================================================
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
-    title="AI Question Generator",
-    version="1.0.0"
+    title="AI Question Generator API",
+    version="1.0.0",
 )
 
-
-# ============================================================
-# CORS
-# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,74 +42,19 @@ app.add_middleware(
 
 
 # ============================================================
-# RAG IMPORT
+# REQUEST MODELS
 # ============================================================
 
-Retriever = None
-retrieve_function = None
-
-try:
-    from rag.retriever import Retriever
-
-    print("RAG Retriever imported successfully.")
-
-except ImportError as e:
-
-    print("RAG Retriever import failed:", e)
-
-    try:
-        from rag.retriever import retrieve as retrieve_function
-
-        print("Fallback RAG retrieve function imported.")
-
-    except ImportError as e2:
-
-        print(
-            "Fallback RAG retrieve function import failed:",
-            e2
-        )
+class GenerateRequest(BaseModel):
+    topic: str
+    subtopic: str | None = None
+    number_of_questions: int = 3
+    bloom_level: str | None = None
+    difficulty: str | None = None
 
 
-# ============================================================
-# LLM IMPORT
-# ============================================================
-
-try:
-
-    from llm.generator import generate_questions
-
-    print("LLM generator imported successfully.")
-
-except ImportError as e:
-
-    print("LLM generator import failed:", e)
-
-    generate_questions = None
-
-
-# ============================================================
-# QDIFF IMPORT
-# ============================================================
-
-# Your qdiff/predict.py contains:
-#
-#     predict_question()
-#
-# NOT:
-#
-#     predict()
-
-try:
-
-    from qdiff.predict import predict_question
-
-    print("QDiff predictor imported successfully.")
-
-except ImportError as e:
-
-    print("QDiff predictor import failed:", e)
-
-    predict_question = None
+class ClassifyRequest(BaseModel):
+    question: str
 
 
 # ============================================================
@@ -107,728 +64,461 @@ except ImportError as e:
 retriever = None
 
 try:
+    retriever = Retriever()
 
-    if Retriever is not None:
+    print("RAG Retriever object created successfully.")
 
-        retriever = Retriever()
+    retriever.load(str(RAG_STORAGE_DIR))
 
-        print("RAG Retriever object created successfully.")
+    print("RAG knowledge base loaded successfully.")
+    print(f"RAG storage: {RAG_STORAGE_DIR}")
 
-        # ----------------------------------------------------
-        # Existing FAISS storage
-        # ----------------------------------------------------
-
-        RAG_STORAGE = (
-            Path(__file__).resolve().parent
-            / "rag_storage"
-        )
-
-        if RAG_STORAGE.exists():
-
-            try:
-
-                retriever.load(
-                    RAG_STORAGE
-                )
-
-                print(
-                    "RAG knowledge base loaded successfully."
-                )
-
-            except Exception as e:
-
-                print(
-                    "RAG knowledge base loading failed:",
-                    e
-                )
-
-        else:
-
-            print(
-                "RAG storage folder not found:",
-                RAG_STORAGE
-            )
+    try:
+        print(f"Total chunks: {len(retriever.documents)}")
+    except Exception:
+        pass
 
 except Exception as e:
-
-    print(
-        "RAG initialization failed:",
-        e
-    )
-
+    print(f"WARNING: Could not load RAG retriever: {e}")
     retriever = None
 
 
 # ============================================================
-# REQUEST MODEL
+# RAG SEARCH
 # ============================================================
 
-class GenerateRequest(BaseModel):
-
-    topic: str
-
-    subtopic: str
-
-    number_of_questions: int = 5
-
-    context: Optional[str] = None
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.get("/api/health")
-def health():
-
-    return {
-
-        "status": "ok",
-
-        "rag": (
-            retriever is not None
-            or retrieve_function is not None
-        ),
-
-        "llm": (
-            generate_questions is not None
-        ),
-
-        "qdiff": (
-            predict_question is not None
-        )
-    }
-
-
-# ============================================================
-# RUN RAG
-# ============================================================
-
-def run_rag(
-    query: str,
-    top_k: int = 10
-):
-
+def run_rag(query: str, top_k: int = 5):
     """
-    Your Retriever class uses:
-
-        search(query, k=5, min_score=0.40)
-
-    It does NOT use retrieve().
+    Retrieve relevant chunks from the RAG knowledge base.
     """
+
+    if retriever is None:
+        print("RAG retriever is not available.")
+        return []
 
     try:
 
-        # ----------------------------------------------------
-        # Existing Retriever class
-        # ----------------------------------------------------
-
-        if retriever is not None:
-
-            results = retriever.search(
-                query=query,
-                k=top_k,
-                min_score=0.40
-            )
-
-            return results
-
-
-        # ----------------------------------------------------
-        # Optional fallback
-        # ----------------------------------------------------
-
-        if retrieve_function is not None:
-
-            results = retrieve_function(
-                query,
-                top_k=top_k
-            )
-
-            return results
-
-
-        print(
-            "RAG is not available."
+        results = retriever.search(
+            query=query,
+            k=top_k,
         )
 
-        return []
+        # ----------------------------------------------------
+        # DEBUG INFORMATION
+        # ----------------------------------------------------
 
+        print("\n========== RAG DEBUG ==========")
+        print("RAG RESULT TYPE:", type(results))
+        print("RAG RESULT COUNT:", len(results))
+
+        for i, result in enumerate(results[:5]):
+
+            print(f"\n--- RESULT {i + 1} ---")
+            print("TYPE:", type(result))
+            print("VALUE:", result)
+
+        print("================================\n")
+
+        print(
+            f"RAG retrieved {len(results)} chunks "
+            f"for query: {query}"
+        )
+
+        return results
 
     except Exception as e:
 
-        print(
-            "RAG retrieval error:",
-            e
-        )
+        print(f"RAG retrieval error: {e}")
 
         return []
 
 
 # ============================================================
-# NORMALIZE RAG RESULT
+# RAG CONTEXT EXTRACTION
 # ============================================================
 
-def normalize_result(result):
-
+def extract_context(chunks):
     """
-    Converts the output of Retriever.search()
-    into a common format.
-    """
-
-    # ========================================================
-    # Dictionary
-    # ========================================================
-
-    if isinstance(result, dict):
-
-        # ----------------------------------------------------
-        # Actual Retriever.search() output:
-        #
-        # {
-        #     "document": {
-        #         "text": "...",
-        #         "source": "...",
-        #         "chunk_id": ...
-        #     },
-        #     "semantic_score": ...,
-        #     "keyword_score": ...,
-        #     "content_quality": ...,
-        #     "combined_score": ...
-        # }
-        # ----------------------------------------------------
-
-        if "document" in result:
-
-            document = result.get(
-                "document",
-                {}
-            )
-
-            if not isinstance(
-                document,
-                dict
-            ):
-
-                document = {}
-
-
-            text = document.get(
-                "text",
-                ""
-            )
-
-
-            return {
-
-                "text": str(
-                    text
-                ).strip(),
-
-                "score": float(
-                    result.get(
-                        "combined_score",
-                        result.get(
-                            "semantic_score",
-                            0.0
-                        )
-                    )
-                ),
-
-                "metadata": {
-
-                    "source": document.get(
-                        "source",
-                        ""
-                    ),
-
-                    "chunk_id": document.get(
-                        "chunk_id",
-                        None
-                    ),
-
-                    "semantic_score": float(
-                        result.get(
-                            "semantic_score",
-                            0.0
-                        )
-                    ),
-
-                    "keyword_score": float(
-                        result.get(
-                            "keyword_score",
-                            0.0
-                        )
-                    ),
-
-                    "content_quality": float(
-                        result.get(
-                            "content_quality",
-                            0.0
-                        )
-                    )
-                }
-            }
-
-
-        # ----------------------------------------------------
-        # Generic dictionary fallback
-        # ----------------------------------------------------
-
-        text = (
-
-            result.get(
-                "text"
-            )
-
-            or
-
-            result.get(
-                "content"
-            )
-
-            or
-
-            ""
-        )
-
-
-        score = result.get(
-
-            "score",
-
-            result.get(
-                "similarity",
-                0.0
-            )
-        )
-
-
-        metadata = result.get(
-            "metadata",
-            {}
-        )
-
-
-        return {
-
-            "text": str(
-                text
-            ).strip(),
-
-            "score": (
-                float(score)
-                if score is not None
-                else 0.0
-            ),
-
-            "metadata": metadata
-        }
-
-
-    # ========================================================
-    # Tuple / list
-    # ========================================================
-
-    if isinstance(
-        result,
-        (tuple, list)
-    ):
-
-        if len(result) >= 2:
-
-            score = result[1]
-
-            if isinstance(
-                score,
-                (int, float)
-            ):
-
-                score = float(score)
-
-            else:
-
-                score = 0.0
-
-
-            return {
-
-                "text": str(
-                    result[0]
-                ).strip(),
-
-                "score": score,
-
-                "metadata": {}
-            }
-
-
-        if len(result) == 1:
-
-            return {
-
-                "text": str(
-                    result[0]
-                ).strip(),
-
-                "score": 0.0,
-
-                "metadata": {}
-            }
-
-
-    # ========================================================
-    # String
-    # ========================================================
-
-    if isinstance(
-        result,
-        str
-    ):
-
-        return {
-
-            "text": result.strip(),
-
-            "score": 0.0,
-
-            "metadata": {}
-        }
-
-
-    # ========================================================
-    # Unknown
-    # ========================================================
-
-    return {
-
-        "text": "",
-
-        "score": 0.0,
-
-        "metadata": {}
+    Convert RAG search results into plain text context.
+
+    Current Retriever.search() structure:
+
+    {
+        "document": {
+            "text": "...actual text...",
+            "source": "...",
+            "chunk_id": 2444
+        },
+        "semantic_score": 0.5957,
+        "keyword_score": 0.6,
+        "phrase_score": 0.12,
+        "subtopic_score": 0.75,
+        "content_quality": 0.85,
+        "id3_content_score": 0.0,
+        "combined_score": 1.0
     }
-
-
-# ============================================================
-# FILTER RELEVANT RESULTS
-# ============================================================
-
-def filter_relevant_results(
-    results,
-    query: str,
-    minimum_results: int = 1
-):
-
     """
-    Performs a lightweight keyword sanity check
-    after the RAG semantic + keyword ranking.
-    """
-
-    if not results:
-
-        return []
-
-
-    # --------------------------------------------------------
-    # Query words
-    # --------------------------------------------------------
-
-    query_words = {
-
-        word.lower().strip(
-            ".,!?;:()[]{}"
-        )
-
-        for word in query.split()
-
-        if len(
-            word.strip(
-                ".,!?;:()[]{}"
-            )
-        ) >= 3
-    }
-
-
-    filtered = []
-
-
-    for result in results:
-
-        normalized = normalize_result(
-            result
-        )
-
-        text = normalized[
-            "text"
-        ]
-
-
-        if not text:
-
-            continue
-
-
-        text_words = {
-
-            word.lower().strip(
-                ".,!?;:()[]{}"
-            )
-
-            for word in text.split()
-
-            if len(
-                word.strip(
-                    ".,!?;:()[]{}"
-                )
-            ) >= 3
-        }
-
-
-        overlap = (
-            query_words
-            .intersection(
-                text_words
-            )
-        )
-
-
-        normalized[
-            "keyword_overlap"
-        ] = len(overlap)
-
-
-        if overlap:
-
-            filtered.append(
-                normalized
-            )
-
-
-    # --------------------------------------------------------
-    # Semantic fallback
-    # --------------------------------------------------------
-    #
-    # If exact keyword matching removes everything,
-    # keep the original RAG-ranked results.
-
-    if len(filtered) < minimum_results:
-
-        normalized_results = [
-
-            normalize_result(
-                result
-            )
-
-            for result in results
-        ]
-
-
-        normalized_results = [
-
-            result
-
-            for result in normalized_results
-
-            if result[
-                "text"
-            ]
-        ]
-
-
-        return normalized_results
-
-
-    return filtered
-
-
-# ============================================================
-# BUILD CONTEXT
-# ============================================================
-
-def build_context(
-    results
-):
-
-    """
-    Combines retrieved chunks into the context
-    supplied to the LLM.
-    """
-
-    if not results:
-
-        return ""
-
 
     context_parts = []
 
+    for chunk in chunks:
 
-    for index, result in enumerate(
-        results,
-        start=1
-    ):
+        # ----------------------------------------------------
+        # CASE 1: STRING
+        # ----------------------------------------------------
 
-        normalized = normalize_result(
-            result
-        )
+        if isinstance(chunk, str):
 
+            text = chunk.strip()
 
-        text = normalized[
-            "text"
-        ].strip()
-
-
-        if not text:
+            if text:
+                context_parts.append(text)
 
             continue
 
+        # ----------------------------------------------------
+        # CASE 2: DICTIONARY
+        # ----------------------------------------------------
 
-        metadata = normalized[
-            "metadata"
-        ]
+        if isinstance(chunk, dict):
 
+            text = ""
 
-        source = metadata.get(
-            "source",
-            "Reference"
-        )
+            # ------------------------------------------------
+            # CURRENT RAG STRUCTURE
+            # ------------------------------------------------
 
+            document = chunk.get("document")
 
-        chunk_id = metadata.get(
-            "chunk_id",
-            ""
-        )
+            if isinstance(document, dict):
 
+                text = (
+                    document.get("text")
+                    or document.get("content")
+                    or document.get("chunk")
+                    or document.get("page_content")
+                    or document.get("raw_text")
+                    or ""
+                )
 
-        context_parts.append(
+            # ------------------------------------------------
+            # FALLBACK FOR FLAT STRUCTURES
+            # ------------------------------------------------
 
-            f"[Reference {index} | "
-            f"Source: {source} | "
-            f"Chunk: {chunk_id}]\n"
-            f"{text}"
-        )
+            if not text:
 
+                text = (
+                    chunk.get("text")
+                    or chunk.get("content")
+                    or chunk.get("chunk")
+                    or chunk.get("page_content")
+                    or chunk.get("raw_text")
+                    or ""
+                )
 
-    return "\n\n".join(
-        context_parts
-    )
+            if isinstance(text, str):
+
+                text = text.strip()
+
+                if text:
+                    context_parts.append(text)
+
+            continue
+
+        # ----------------------------------------------------
+        # CASE 3: OBJECT WITH ATTRIBUTES
+        # ----------------------------------------------------
+
+        for attribute in [
+            "text",
+            "content",
+            "chunk",
+            "document",
+            "page_content",
+            "raw_text",
+        ]:
+
+            try:
+
+                value = getattr(
+                    chunk,
+                    attribute,
+                    None,
+                )
+
+                # Nested document object
+                if attribute == "document":
+
+                    if isinstance(value, dict):
+
+                        text = (
+                            value.get("text")
+                            or value.get("content")
+                            or value.get("chunk")
+                            or value.get("page_content")
+                            or value.get("raw_text")
+                            or ""
+                        )
+
+                        if (
+                            isinstance(text, str)
+                            and text.strip()
+                        ):
+
+                            context_parts.append(
+                                text.strip()
+                            )
+
+                            break
+
+                elif (
+                    isinstance(value, str)
+                    and value.strip()
+                ):
+
+                    context_parts.append(
+                        value.strip()
+                    )
+
+                    break
+
+            except Exception:
+                continue
+
+    return "\n\n".join(context_parts)
 
 
 # ============================================================
-# RUN QDIFF
+# QDIFF CLASSIFICATION
 # ============================================================
 
-def run_qdiff(
-    question: str
-):
-
-    """
-    Runs the trained QDiff model.
-    """
-
-    if predict_question is None:
-
-        print(
-            "QDiff predictor is not available."
-        )
-
-        return {
-
-            "bloom_level": None,
-
-            "difficulty": None,
-
-            "bloom_confidence": 0.0,
-
-            "difficulty_confidence": 0.0,
-
-            "confidence": 0.0
-        }
-
+def classify_with_qdiff(question: str):
 
     try:
 
-        result = predict_question(
-            question
-        )
-
-
-        if not isinstance(
-            result,
-            dict
-        ):
-
-            print(
-                "Unexpected QDiff output:",
-                result
-            )
-
-            return {
-
-                "bloom_level": None,
-
-                "difficulty": None,
-
-                "bloom_confidence": 0.0,
-
-                "difficulty_confidence": 0.0,
-
-                "confidence": 0.0
-            }
-
+        result = predict_question(question)
 
         return {
-
-            "bloom_level": result.get(
-                "bloom_level"
-            ),
-
-            "difficulty": result.get(
-                "difficulty"
-            ),
-
-            "bloom_confidence": float(
-                result.get(
-                    "bloom_confidence",
-                    0.0
-                )
-            ),
-
-            "difficulty_confidence": float(
-                result.get(
-                    "difficulty_confidence",
-                    0.0
-                )
-            ),
-
-            "confidence": float(
-                result.get(
-                    "confidence",
-                    0.0
-                )
-            )
+            "success": True,
+            "result": result,
         }
-
 
     except Exception as e:
 
         print(
-            "QDiff prediction error:",
-            e
+            f"QDiff classification error: {e}"
         )
 
         return {
-
-            "bloom_level": None,
-
-            "difficulty": None,
-
-            "bloom_confidence": 0.0,
-
-            "difficulty_confidence": 0.0,
-
-            "confidence": 0.0
+            "success": False,
+            "result": None,
+            "error": str(e),
         }
+
+
+# ============================================================
+# QWEN CLASSIFICATION
+# ============================================================
+
+def classify_with_qwen(question: str):
+
+    try:
+
+        result = classify_question_with_llm(
+            question
+        )
+
+        return {
+            "success": True,
+            "result": result,
+        }
+
+    except Exception as e:
+
+        print(
+            f"Qwen classification error: {e}"
+        )
+
+        return {
+            "success": False,
+            "result": None,
+            "error": str(e),
+        }
+
+
+# ============================================================
+# COMPARE QDIFF + QWEN
+# ============================================================
+
+def compare_predictions(
+    question: str,
+    qdiff_result,
+    qwen_result,
+    requested_bloom=None,
+    requested_difficulty=None,
+):
+    """
+    Compare QDiff and Qwen predictions.
+
+    QDiff remains the primary classifier unless Qwen has
+    strong semantic confidence and QDiff is uncertain.
+    """
+
+    qdiff = qdiff_result or {}
+    qwen = qwen_result or {}
+
+    qdiff_bloom = qdiff.get(
+        "bloom_level"
+    )
+
+    qdiff_difficulty = qdiff.get(
+        "difficulty"
+    )
+
+    qwen_bloom = qwen.get(
+        "bloom_level"
+    )
+
+    qwen_difficulty = qwen.get(
+        "difficulty"
+    )
+
+    qdiff_confidence = float(
+        qdiff.get("confidence", 0.0) or 0.0
+    )
+
+    qwen_confidence = float(
+        qwen.get("confidence", 0.0) or 0.0
+    )
+
+    final_bloom = qdiff_bloom
+    final_difficulty = qdiff_difficulty
+    final_confidence = qdiff_confidence
+
+    reason = "QDiff primary prediction."
+
+    # --------------------------------------------------------
+    # QWEN HIGH CONFIDENCE + QDIFF LOW CONFIDENCE
+    # --------------------------------------------------------
+
+    if (
+        qwen_confidence >= 0.85
+        and qdiff_confidence < 0.70
+        and qwen_bloom == qdiff_bloom
+    ):
+
+        final_difficulty = qwen_difficulty
+        final_confidence = qwen_confidence
+
+        reason = (
+            "Qwen semantic verification used because "
+            "QDiff difficulty confidence was low."
+        )
+
+    # --------------------------------------------------------
+    # FULL AGREEMENT
+    # --------------------------------------------------------
+
+    elif (
+        qdiff_bloom == qwen_bloom
+        and qdiff_difficulty == qwen_difficulty
+    ):
+
+        final_bloom = qdiff_bloom
+        final_difficulty = qdiff_difficulty
+
+        final_confidence = max(
+            qdiff_confidence,
+            qwen_confidence,
+        )
+
+        reason = "QDiff and Qwen agree."
+
+    # --------------------------------------------------------
+    # REQUESTED BLOOM MATCH
+    # --------------------------------------------------------
+
+    if requested_bloom:
+
+        if (
+            qwen_bloom == requested_bloom
+            and qdiff_bloom != requested_bloom
+        ):
+
+            if qwen_confidence >= 0.85:
+
+                final_bloom = qwen_bloom
+
+                final_confidence = max(
+                    final_confidence,
+                    qwen_confidence,
+                )
+
+                reason = (
+                    "Qwen matched the requested Bloom "
+                    "level with high confidence."
+                )
+
+    # --------------------------------------------------------
+    # REQUESTED DIFFICULTY MATCH
+    # --------------------------------------------------------
+
+    if requested_difficulty:
+
+        if (
+            qwen_difficulty == requested_difficulty
+            and qdiff_difficulty != requested_difficulty
+        ):
+
+            if qwen_confidence >= 0.85:
+
+                final_difficulty = qwen_difficulty
+
+                final_confidence = max(
+                    final_confidence,
+                    qwen_confidence,
+                )
+
+                reason = (
+                    "Qwen matched the requested difficulty "
+                    "with high confidence."
+                )
+
+    return {
+        "bloom_level": final_bloom,
+        "difficulty": final_difficulty,
+        "confidence": final_confidence,
+        "reason": reason,
+        "qdiff": qdiff,
+        "qwen": qwen,
+    }
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    rag_chunks = 0
+
+    if retriever is not None:
+
+        try:
+            rag_chunks = len(
+                retriever.documents
+            )
+
+        except Exception:
+            rag_chunks = 0
+
+    return {
+        "success": True,
+        "status": "running",
+        "rag_loaded": retriever is not None,
+        "rag_chunks": rag_chunks,
+    }
 
 
 # ============================================================
@@ -836,597 +526,636 @@ def run_qdiff(
 # ============================================================
 
 @app.post("/api/generate")
-def generate(
-    request: GenerateRequest
-):
+def generate(request: GenerateRequest):
+
+    # --------------------------------------------------------
+    # INPUT
+    # --------------------------------------------------------
 
     topic = request.topic.strip()
-
-    subtopic = request.subtopic.strip()
-
-    number_of_questions = (
-        request.number_of_questions
-    )
-
-
-    # ========================================================
-    # VALIDATION
-    # ========================================================
 
     if not topic:
 
         return {
-
             "success": False,
-
             "error": "Topic is required.",
-
-            "questions": []
         }
 
-
-    if not subtopic:
-
-        return {
-
-            "success": False,
-
-            "error": "Subtopic is required.",
-
-            "questions": []
-        }
-
-
-    if number_of_questions < 1:
-
-        return {
-
-            "success": False,
-
-            "error": (
-                "Number of questions "
-                "must be at least 1."
-            ),
-
-            "questions": []
-        }
-
-
-    if number_of_questions > 20:
-
-        return {
-
-            "success": False,
-
-            "error": (
-                "Maximum 20 questions "
-                "are allowed."
-            ),
-
-            "questions": []
-        }
-
-
-    # ========================================================
-    # CHECK LLM
-    # ========================================================
-
-    if generate_questions is None:
-
-        return {
-
-            "success": False,
-
-            "error": (
-                "LLM generator "
-                "is not available."
-            ),
-
-            "questions": []
-        }
-
-
-    # ========================================================
-    # RAG QUERY
-    # ========================================================
-
-    # Use the specific subtopic instead of only
-    # the broad topic.
-
-    retrieval_query = subtopic
-
-
-    print()
-    print(
-        "========================================"
+    number_of_questions = max(
+        1,
+        min(
+            request.number_of_questions,
+            10,
+        ),
     )
 
-    print(
-        "RAG QUERY"
+    bloom_level = (
+        request.bloom_level
+        or "Understand"
     )
 
-    print(
-        "========================================"
+    difficulty = (
+        request.difficulty
+        or "Medium"
     )
 
-    print(
-        "Topic:",
-        topic
-    )
+    # --------------------------------------------------------
+    # BUILD RAG QUERY
+    # --------------------------------------------------------
 
-    print(
-        "Subtopic:",
-        subtopic
-    )
+    query_parts = [topic]
 
-    print(
-        "Retrieval query:",
-        retrieval_query
-    )
+    if request.subtopic:
 
+        query_parts.append(
+            request.subtopic
+        )
 
-    # ========================================================
+    query = " ".join(query_parts)
+
+    # --------------------------------------------------------
     # RAG RETRIEVAL
-    # ========================================================
+    # --------------------------------------------------------
 
-    retrieved_results = run_rag(
-
-        retrieval_query,
-
-        top_k=10
+    chunks = run_rag(
+        query=query,
+        top_k=5,
     )
 
+    # --------------------------------------------------------
+    # EXTRACT CONTEXT
+    # --------------------------------------------------------
+
+    context = extract_context(
+        chunks
+    )
 
     print(
-        "Retrieved results:",
-        len(
-            retrieved_results
+        f"Generation request: "
+        f"{number_of_questions} questions | "
+        f"Bloom={bloom_level} | "
+        f"Difficulty={difficulty}"
+    )
+
+    print(
+        f"Reference chunks: {len(chunks)}"
+    )
+
+    print(
+        f"Context length: "
+        f"{len(context)} characters"
+    )
+
+    # --------------------------------------------------------
+    # CONTEXT PREVIEW
+    # --------------------------------------------------------
+
+    if context:
+
+        print(
+            "\n========== RAG CONTEXT PREVIEW =========="
         )
-    )
 
-
-    # ========================================================
-    # FILTER
-    # ========================================================
-
-    filtered_results = (
-        filter_relevant_results(
-
-            retrieved_results,
-
-            subtopic,
-
-            minimum_results=1
+        print(
+            context[:2000]
         )
-    )
 
+        if len(context) > 2000:
 
-    print(
-        "Relevant results:",
-        len(
-            filtered_results
+            print(
+                "\n...[context truncated]..."
+            )
+
+        print(
+            "==========================================\n"
         )
-    )
 
+    else:
 
-    # ========================================================
-    # BUILD CONTEXT
-    # ========================================================
+        print(
+            "\nWARNING: RAG returned chunks but "
+            "no text was extracted from them.\n"
+        )
 
-    context = build_context(
-        filtered_results
-    )
-
-
-    # ========================================================
-    # NO REFERENCE MATERIAL
-    # ========================================================
-
-    if not context.strip():
-
-        return {
-
-            "success": False,
-
-            "error": (
-                "Relevant reference material "
-                "not found for the requested "
-                "subtopic."
-            ),
-
-            "questions": []
-        }
-
-
-    # ========================================================
-    # SHOW CONTEXT
-    # ========================================================
-
-    print()
-    print(
-        "========================================"
-    )
-
-    print(
-        "RETRIEVED REFERENCE CONTEXT"
-    )
-
-    print(
-        "========================================"
-    )
-
-    print(
-        context[:5000]
-    )
-
-
-    # ========================================================
-    # LLM GENERATION
-    # ========================================================
-
-    print()
-    print(
-        "========================================"
-    )
-
-    print(
-        "GENERATING QUESTIONS"
-    )
-
-    print(
-        "========================================"
-    )
-
+    # --------------------------------------------------------
+    # GENERATE QUESTIONS
+    # --------------------------------------------------------
 
     try:
 
         generated = generate_questions(
-
             topic=topic,
-
-            subtopic=subtopic,
-
+            subtopic=request.subtopic,
             context=context,
-
-            number_of_questions=(
-                number_of_questions
-            )
+            number_of_questions=number_of_questions,
+            bloom_level=bloom_level,
+            difficulty=difficulty,
         )
-
-
-    except TypeError:
-
-        # ----------------------------------------------------
-        # Compatibility fallback
-        # ----------------------------------------------------
-
-        try:
-
-            generated = generate_questions(
-
-                topic,
-
-                subtopic,
-
-                context,
-
-                number_of_questions
-            )
-
-        except Exception as e:
-
-            print(
-                "LLM generation error:",
-                e
-            )
-
-            return {
-
-                "success": False,
-
-                "error": (
-                    f"LLM generation failed: "
-                    f"{str(e)}"
-                ),
-
-                "questions": []
-            }
-
 
     except Exception as e:
 
         print(
-            "LLM generation error:",
-            e
+            f"Question generation error: {e}"
         )
 
         return {
-
             "success": False,
-
-            "error": (
-                f"LLM generation failed: "
-                f"{str(e)}"
+            "error": str(e),
+            "reference_chunks": len(
+                chunks
             ),
-
-            "questions": []
+            "context_length": len(
+                context
+            ),
         }
 
+    # --------------------------------------------------------
+    # NORMALIZE GENERATED RESULT
+    # --------------------------------------------------------
 
-    # ========================================================
-    # EXTRACT GENERATED QUESTIONS
-    # ========================================================
+    if generated is None:
 
-    if hasattr(
-        generated,
-        "questions"
-    ):
-
-        raw_questions = (
-            generated.questions
-        )
-
+        questions = []
 
     elif isinstance(
         generated,
-        dict
+        list,
     ):
 
-        raw_questions = (
-            generated.get(
-                "questions",
-                []
-            )
-        )
-
+        questions = generated
 
     elif isinstance(
         generated,
-        list
+        dict,
     ):
 
-        raw_questions = generated
-
+        questions = generated.get(
+            "questions",
+            [],
+        )
 
     else:
 
-        raw_questions = []
+        try:
 
+            questions = generated.questions
 
-    # ========================================================
+        except Exception:
+
+            questions = []
+
+    print(
+        f"Generated questions returned: "
+        f"{len(questions)}"
+    )
+
+    # --------------------------------------------------------
     # PROCESS QUESTIONS
-    # ========================================================
+    # --------------------------------------------------------
 
-    questions = []
+    final_questions = []
 
-
-    for item in raw_questions:
+    for question_item in questions:
 
         # ----------------------------------------------------
-        # Pydantic object
+        # EXTRACT QUESTION TEXT
         # ----------------------------------------------------
 
-        if hasattr(
-            item,
-            "question"
+        if isinstance(
+            question_item,
+            str,
         ):
 
-            question_text = str(
-                item.question
-            ).strip()
-
-
-        # ----------------------------------------------------
-        # Dictionary
-        # ----------------------------------------------------
+            question_text = (
+                question_item.strip()
+            )
 
         elif isinstance(
-            item,
-            dict
+            question_item,
+            dict,
         ):
 
-            question_text = str(
-
-                item.get(
-                    "question",
-                    ""
+            question_text = (
+                question_item.get(
+                    "question"
                 )
-
+                or question_item.get(
+                    "text"
+                )
+                or question_item.get(
+                    "question_text"
+                )
+                or ""
             ).strip()
-
-
-        # ----------------------------------------------------
-        # String
-        # ----------------------------------------------------
-
-        elif isinstance(
-            item,
-            str
-        ):
-
-            question_text = item.strip()
-
 
         else:
 
-            question_text = ""
-
+            question_text = (
+                getattr(
+                    question_item,
+                    "question",
+                    "",
+                )
+                or getattr(
+                    question_item,
+                    "text",
+                    "",
+                )
+                or getattr(
+                    question_item,
+                    "question_text",
+                    "",
+                )
+                or ""
+            ).strip()
 
         if not question_text:
 
             continue
 
+        # ----------------------------------------------------
+        # QDIFF + QWEN IN PARALLEL
+        # ----------------------------------------------------
 
-        # ====================================================
-        # QDIFF
-        # ====================================================
+        with ThreadPoolExecutor(
+            max_workers=2
+        ) as executor:
 
-        qdiff_result = run_qdiff(
-            question_text
-        )
-
-
-        # ====================================================
-        # FINAL QUESTION OBJECT
-        # ====================================================
-
-        questions.append({
-
-            "question": question_text,
-
-            "bloom_level": (
-                qdiff_result[
-                    "bloom_level"
-                ]
-            ),
-
-            "difficulty": (
-                qdiff_result[
-                    "difficulty"
-                ]
-            ),
-
-            "bloom_confidence": (
-                qdiff_result[
-                    "bloom_confidence"
-                ]
-            ),
-
-            "difficulty_confidence": (
-                qdiff_result[
-                    "difficulty_confidence"
-                ]
-            ),
-
-            "confidence": (
-                qdiff_result[
-                    "confidence"
-                ]
+            qdiff_future = executor.submit(
+                classify_with_qdiff,
+                question_text,
             )
-        })
 
+            qwen_future = executor.submit(
+                classify_with_qwen,
+                question_text,
+            )
 
-    # ========================================================
-    # NO QUESTIONS
-    # ========================================================
+            qdiff_response = (
+                qdiff_future.result()
+            )
 
-    if not questions:
+            qwen_response = (
+                qwen_future.result()
+            )
 
-        return {
-
-            "success": False,
-
-            "error": (
-                "The LLM did not generate "
-                "valid questions from the "
-                "retrieved reference material."
-            ),
-
-            "questions": []
-        }
-
-
-    # ========================================================
-    # PRINT FINAL QUESTIONS
-    # ========================================================
-
-    print()
-    print(
-        "========================================"
-    )
-
-    print(
-        "FINAL QUESTIONS"
-    )
-
-    print(
-        "========================================"
-    )
-
-
-    for index, question in enumerate(
-        questions,
-        start=1
-    ):
-
-        print(
-            f"{index}. "
-            f"{question['question']}"
+        qdiff_result = (
+            qdiff_response.get(
+                "result"
+            )
+            if qdiff_response.get(
+                "success"
+            )
+            else {}
         )
 
-        print(
-            "   Bloom:",
-            question[
-                "bloom_level"
-            ]
+        qwen_result = (
+            qwen_response.get(
+                "result"
+            )
+            if qwen_response.get(
+                "success"
+            )
+            else {}
         )
 
-        print(
-            "   Difficulty:",
-            question[
-                "difficulty"
-            ]
+        # ----------------------------------------------------
+        # COMPARE
+        # ----------------------------------------------------
+
+        comparison = compare_predictions(
+            question=question_text,
+            qdiff_result=qdiff_result,
+            qwen_result=qwen_result,
+            requested_bloom=bloom_level,
+            requested_difficulty=difficulty,
         )
 
-        print(
-            "   Bloom confidence:",
-            question[
-                "bloom_confidence"
-            ]
+        final_bloom = comparison.get(
+            "bloom_level"
         )
 
-        print(
-            "   Difficulty confidence:",
-            question[
-                "difficulty_confidence"
-            ]
+        final_difficulty = comparison.get(
+            "difficulty"
         )
 
-        print(
-            "   Overall confidence:",
-            question[
-                "confidence"
-            ]
+        final_confidence = comparison.get(
+            "confidence",
+            0.0,
         )
 
+        # ----------------------------------------------------
+        # VERIFY
+        # ----------------------------------------------------
 
-    # ========================================================
+        verified = (
+            final_bloom == bloom_level
+            and final_difficulty == difficulty
+        )
+
+        # ----------------------------------------------------
+        # REFINE IF REQUIRED
+        # ----------------------------------------------------
+
+        if not verified:
+
+            try:
+
+                refined = (
+                    refine_question_with_qwen(
+                        question=question_text,
+                        requested_bloom=bloom_level,
+                        requested_difficulty=difficulty,
+                    )
+                )
+
+                if refined:
+
+                    if isinstance(
+                        refined,
+                        str,
+                    ):
+
+                        refined_question = (
+                            refined.strip()
+                        )
+
+                    elif isinstance(
+                        refined,
+                        dict,
+                    ):
+
+                        refined_question = (
+                            refined.get(
+                                "question"
+                            )
+                            or refined.get(
+                                "text"
+                            )
+                            or refined.get(
+                                "question_text"
+                            )
+                            or question_text
+                        ).strip()
+
+                    else:
+
+                        refined_question = (
+                            getattr(
+                                refined,
+                                "question",
+                                "",
+                            )
+                            or getattr(
+                                refined,
+                                "text",
+                                "",
+                            )
+                            or question_text
+                        ).strip()
+
+                    # ----------------------------------------
+                    # RECLASSIFY REFINED QUESTION
+                    # ----------------------------------------
+
+                    with ThreadPoolExecutor(
+                        max_workers=2
+                    ) as executor:
+
+                        qdiff_future = (
+                            executor.submit(
+                                classify_with_qdiff,
+                                refined_question,
+                            )
+                        )
+
+                        qwen_future = (
+                            executor.submit(
+                                classify_with_qwen,
+                                refined_question,
+                            )
+                        )
+
+                        refined_qdiff_response = (
+                            qdiff_future.result()
+                        )
+
+                        refined_qwen_response = (
+                            qwen_future.result()
+                        )
+
+                    refined_qdiff = (
+                        refined_qdiff_response.get(
+                            "result"
+                        )
+                        if refined_qdiff_response.get(
+                            "success"
+                        )
+                        else {}
+                    )
+
+                    refined_qwen = (
+                        refined_qwen_response.get(
+                            "result"
+                        )
+                        if refined_qwen_response.get(
+                            "success"
+                        )
+                        else {}
+                    )
+
+                    refined_comparison = (
+                        compare_predictions(
+                            question=refined_question,
+                            qdiff_result=refined_qdiff,
+                            qwen_result=refined_qwen,
+                            requested_bloom=bloom_level,
+                            requested_difficulty=difficulty,
+                        )
+                    )
+
+                    question_text = (
+                        refined_question
+                    )
+
+                    final_bloom = (
+                        refined_comparison.get(
+                            "bloom_level"
+                        )
+                    )
+
+                    final_difficulty = (
+                        refined_comparison.get(
+                            "difficulty"
+                        )
+                    )
+
+                    final_confidence = (
+                        refined_comparison.get(
+                            "confidence",
+                            0.0,
+                        )
+                    )
+
+                    verified = (
+                        final_bloom == bloom_level
+                        and final_difficulty
+                        == difficulty
+                    )
+
+                    qdiff_result = (
+                        refined_qdiff
+                    )
+
+                    qwen_result = (
+                        refined_qwen
+                    )
+
+                    comparison = (
+                        refined_comparison
+                    )
+
+            except Exception as e:
+
+                print(
+                    f"Question refinement error: {e}"
+                )
+
+        # ----------------------------------------------------
+        # ADD FINAL QUESTION
+        # ----------------------------------------------------
+
+        final_questions.append(
+            {
+                "question": question_text,
+                "bloom_level": final_bloom,
+                "difficulty": final_difficulty,
+                "confidence": final_confidence,
+                "verified": verified,
+                "qdiff": qdiff_result,
+                "qwen": qwen_result,
+                "reason": comparison.get(
+                    "reason",
+                    "",
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
     # RESPONSE
-    # ========================================================
+    # --------------------------------------------------------
 
     return {
-
         "success": True,
-
         "topic": topic,
-
-        "subtopic": subtopic,
-
-        "requested_questions": (
-            number_of_questions
-        ),
-
-        "generated_questions": len(
-            questions
-        ),
-
-        "retrieved_chunks": len(
-            filtered_results
-        ),
-
-        "questions": questions
+        "subtopic": request.subtopic,
+        "requested_bloom": bloom_level,
+        "requested_difficulty": difficulty,
+        "number_requested": number_of_questions,
+        "reference_chunks": len(chunks),
+        "context_length": len(context),
+        "questions": final_questions,
     }
 
 
 # ============================================================
-# ROOT
+# CLASSIFY EXISTING QUESTION
 # ============================================================
 
-@app.get("/")
-def root():
+@app.post("/api/classify")
+def classify(request: ClassifyRequest):
+
+    question = request.question.strip()
+
+    if not question:
+
+        return {
+            "success": False,
+            "error": "Question is required.",
+        }
+
+    print(
+        f"\nClassification request: "
+        f"{question}"
+    )
+
+    # --------------------------------------------------------
+    # QDIFF + QWEN IN PARALLEL
+    # --------------------------------------------------------
+
+    with ThreadPoolExecutor(
+        max_workers=2
+    ) as executor:
+
+        qdiff_future = executor.submit(
+            classify_with_qdiff,
+            question,
+        )
+
+        qwen_future = executor.submit(
+            classify_with_qwen,
+            question,
+        )
+
+        qdiff_response = (
+            qdiff_future.result()
+        )
+
+        qwen_response = (
+            qwen_future.result()
+        )
+
+    qdiff_result = (
+        qdiff_response.get(
+            "result"
+        )
+        if qdiff_response.get(
+            "success"
+        )
+        else {}
+    )
+
+    qwen_result = (
+        qwen_response.get(
+            "result"
+        )
+        if qwen_response.get(
+            "success"
+        )
+        else {}
+    )
+
+    # --------------------------------------------------------
+    # COMPARE
+    # --------------------------------------------------------
+
+    comparison = compare_predictions(
+        question=question,
+        qdiff_result=qdiff_result,
+        qwen_result=qwen_result,
+    )
+
+    # --------------------------------------------------------
+    # RESPONSE
+    # --------------------------------------------------------
 
     return {
-
-        "message":
-            "AI Question Generator API is running."
+        "success": True,
+        "question": question,
+        "bloom_level": comparison.get(
+            "bloom_level"
+        ),
+        "difficulty": comparison.get(
+            "difficulty"
+        ),
+        "confidence": comparison.get(
+            "confidence",
+            0.0,
+        ),
+        "qdiff": qdiff_result,
+        "qwen": qwen_result,
+        "reason": comparison.get(
+            "reason",
+            "",
+        ),
     }

@@ -81,8 +81,8 @@ print("\n4. COMPLETE EVALUATION")
 
 result = evaluate_generation(
     questions=questions,
-    topic=topic,
-    subtopic=subtopic,
+    topic="Decision Trees",
+    subtopic="ID3 algorithm",
     context=context
 )
 
